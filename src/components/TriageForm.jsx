@@ -1,23 +1,26 @@
- import { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { db } from '../db/schema';
 
 export default function TriageForm() {
   const [patients, setPatients] = useState([]);
   const [selectedPatient, setSelectedPatient] = useState(null);
+  const [selectedDestination, setSelectedDestination] = useState(null);
   const [saved, setSaved] = useState(false);
+  const [message, setMessage] = useState('');
 
   useEffect(() => {
     loadPatients();
   }, []);
 
   const loadPatients = async () => {
-    const needingTriage = await db.getPatientsNeedingTriage();
-    setPatients(needingTriage);
+    // FIXED: Use getPatientsForStage('triage') — patients whose NEXT stage is triage
+    const waitingPatients = await db.getPatientsForStage('triage');
+    setPatients(waitingPatients);
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!selectedPatient) return;
+    if (!selectedPatient || !selectedDestination) return;
 
     const form = e.target;
     const localId = db.generateTempId('ENC-TRI');
@@ -29,7 +32,7 @@ export default function TriageForm() {
       server_id: null,
       patient_local_id: selectedPatient.local_id,
       encounter_type: 'triage',
-      parent_encounter_id: null,
+      parent_encounter_id: selectedPatient.lastEncounter?.local_id || null,
       vitals_json: JSON.stringify({
         bp: form.bp.value,
         temp: parseFloat(form.temp.value),
@@ -39,6 +42,7 @@ export default function TriageForm() {
       }),
       chief_complaint: form.complaint.value,
       priority: form.priority.value,
+      notes: `Sent to ${selectedDestination.toUpperCase()} after triage`,
       department_code: 'TRI-01',
       facility_code: localStorage.getItem('facility_code') || 'DEMO-FAC-001',
       clinician_id: form.nurse_id.value,
@@ -51,16 +55,26 @@ export default function TriageForm() {
 
     try {
       await db.encounters.add(encounter);
-      await db.queueForSync('encounters', localId, 2); // Priority 2
+      await db.queueForSync('encounters', localId, 2);
+      
+      // Update patient journey: registration → triage → [lab or doctor]
+      // This also queues patientJourney for sync automatically
+      await db.completeStage(
+        selectedPatient.local_id,
+        selectedDestination // 'lab' or 'consultation'
+      );
       
       setSaved(true);
-      setSelectedPatient(null);
+      setMessage(`✓ ${selectedPatient.name} triaged and sent to ${selectedDestination.toUpperCase()}!`);
+      
       setTimeout(() => {
         setSaved(false);
-        loadPatients(); // Refresh list
-      }, 1500);
+        setSelectedPatient(null);
+        setSelectedDestination(null);
+        loadPatients();
+      }, 2000);
     } catch (err) {
-      alert('Error saving triage: ' + err.message);
+      setMessage('Error: ' + err.message);
     }
   };
 
@@ -73,19 +87,23 @@ export default function TriageForm() {
     return colors[priority] || colors.green;
   };
 
+  const parseVitals = (json) => {
+    try { return JSON.parse(json || '{}'); } catch { return {}; }
+  };
+
   return (
     <div className="max-w-2xl mx-auto p-4">
-      <h2 className="text-xl font-bold mb-4 text-gray-800">Triage - Patient Vitals</h2>
+      <h2 className="text-xl font-bold mb-4 text-gray-800">Triage - Patient Vitals & Routing</h2>
       
-      {saved && (
-        <div className="mb-4 p-3 bg-green-100 text-green-800 rounded text-sm">
-          ✓ Triage saved locally. Will sync when online.
+      {message && (
+        <div className={`mb-4 p-3 rounded text-sm ${message.includes('Error') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+          {message}
         </div>
       )}
 
       {!selectedPatient ? (
         <div>
-          <p className="text-sm text-gray-600 mb-3">Select a patient registered today who needs triage:</p>
+          <p className="text-sm text-gray-600 mb-3">Patients checked in at reception waiting for triage:</p>
           <div className="space-y-2">
             {patients.length === 0 && (
               <p className="text-gray-500 text-center py-8">No patients waiting for triage.</p>
@@ -94,27 +112,76 @@ export default function TriageForm() {
               <button
                 key={p.local_id}
                 onClick={() => setSelectedPatient(p)}
-                className="w-full p-3 bg-white rounded shadow border-l-4 border-blue-500 text-left hover:bg-blue-50"
+                className="w-full p-4 bg-white rounded shadow border-l-4 border-blue-500 text-left hover:bg-blue-50"
               >
-                <div className="font-semibold">{p.name}</div>
-                <div className="text-sm text-gray-600">{p.phone} | {p.gender} | {p.county}</div>
-                <div className="text-xs text-gray-500 mt-1">Registered: {new Date(p.created_at).toLocaleTimeString('en-KE')}</div>
+                <div className="flex justify-between">
+                  <div>
+                    <div className="font-bold text-lg">{p.name}</div>
+                    <div className="text-sm text-gray-600">
+                      ID: {p.local_id} | {p.gender} | {p.phone}
+                    </div>
+                    <div className="text-xs text-gray-500 mt-1">
+                      Checked in: {new Date(p.journey?.updated_at || p.created_at).toLocaleTimeString('en-KE')}
+                    </div>
+                  </div>
+                  <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-xs font-medium self-center">
+                    Select
+                  </span>
+                </div>
               </button>
             ))}
           </div>
         </div>
+      ) : !selectedDestination ? (
+        <div className="bg-white rounded shadow p-6">
+          <div className="mb-4 p-3 bg-blue-50 rounded">
+            <div className="font-bold">{selectedPatient.name}</div>
+            <div className="text-sm text-gray-600">{selectedPatient.phone} | {selectedPatient.gender}</div>
+          </div>
+          
+          <h3 className="font-semibold mb-4 text-center">Where should this patient go?</h3>
+          
+          <div className="grid grid-cols-2 gap-4">
+            <button
+              onClick={() => setSelectedDestination('lab')}
+              className="p-6 bg-indigo-50 border-2 border-indigo-200 rounded-lg hover:bg-indigo-100 hover:border-indigo-400 text-center"
+            >
+              <div className="text-3xl mb-2">🧪</div>
+              <div className="font-bold text-indigo-800">Send to LAB</div>
+              <div className="text-xs text-indigo-600 mt-1">Blood tests, imaging, etc.</div>
+            </button>
+            
+            <button
+              onClick={() => setSelectedDestination('consultation')}
+              className="p-6 bg-green-50 border-2 border-green-200 rounded-lg hover:bg-green-100 hover:border-green-400 text-center"
+            >
+              <div className="text-3xl mb-2">👨‍⚕️</div>
+              <div className="font-bold text-green-800">Send to DOCTOR</div>
+              <div className="text-xs text-green-600 mt-1">Direct consultation</div>
+            </button>
+          </div>
+          
+          <button
+            onClick={() => { setSelectedPatient(null); setSelectedDestination(null); }}
+            className="w-full mt-4 py-2 text-gray-600 hover:text-gray-800"
+          >
+            ← Back to Patient List
+          </button>
+        </div>
       ) : (
         <div>
-          <div className="mb-4 p-3 bg-blue-50 rounded flex justify-between items-center">
+          <div className="mb-4 p-3 bg-yellow-50 rounded flex justify-between items-center">
             <div>
-              <div className="font-semibold">{selectedPatient.name}</div>
-              <div className="text-sm text-gray-600">{selectedPatient.phone}</div>
+              <div className="font-bold">{selectedPatient.name}</div>
+              <div className="text-sm text-gray-600">
+                Routing to: <span className="font-semibold text-indigo-700">{selectedDestination.toUpperCase()}</span>
+              </div>
             </div>
             <button 
-              onClick={() => setSelectedPatient(null)}
+              onClick={() => setSelectedDestination(null)}
               className="text-sm text-blue-600 hover:underline"
             >
-              Change Patient
+              Change Destination
             </button>
           </div>
 
@@ -177,9 +244,9 @@ export default function TriageForm() {
 
             <button 
               type="submit"
-              className="w-full py-2 px-4 bg-yellow-600 text-white rounded hover:bg-yellow-700 font-medium"
+              className="w-full py-3 bg-yellow-600 text-white rounded hover:bg-yellow-700 font-medium"
             >
-              Save Triage & Send to Doctor
+              Save Triage & Send to {selectedDestination.toUpperCase()}
             </button>
           </form>
         </div>

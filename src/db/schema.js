@@ -4,12 +4,13 @@ class HospitalDB extends Dexie {
   constructor() {
     super('HospitalDB');
     
-    this.version(2).stores({
-      // Existing tables
+    // Version 6: Force recreate with all fixes applied
+    this.version(6).stores({
       patients: '++local_id, server_id, national_id, phone, name, facility_code, sync_status, device_id, version, updated_at',
       encounters: '++local_id, server_id, patient_local_id, encounter_type, parent_encounter_id, department_code, facility_code, sync_status, device_id, version, updated_at',
       bills: '++local_id, server_id, encounter_local_id, payment_status, sync_status, device_id, version, updated_at',
-      syncQueue: '++id, table_name, local_id, action, priority, timestamp, retry_count',
+      patientJourney: '++id, patient_local_id, current_stage, next_stage, status, sync_status, updated_at',
+      syncQueue: '++id, table_name, local_id, action, priority, timestamp, retry_count, last_error',
       meta: 'key'
     });
   }
@@ -21,6 +22,19 @@ class HospitalDB extends Dexie {
   }
 
   async queueForSync(tableName, localId, priority = 99) {
+    // Prevent duplicate queue entries
+    const existing = await this.syncQueue
+      .where({ table_name: tableName, local_id: localId })
+      .first();
+    
+    if (existing) {
+      // Update priority if higher
+      if (priority < existing.priority) {
+        await this.syncQueue.update(existing.id, { priority });
+      }
+      return;
+    }
+
     await this.syncQueue.add({
       table_name: tableName,
       local_id: localId,
@@ -40,60 +54,143 @@ class HospitalDB extends Dexie {
     return deviceId;
   }
 
-  getDepartment() {
-    return localStorage.getItem('department') || 'reception';
+  // PATIENT JOURNEY HELPERS
+
+  async updatePatientJourney(patientLocalId, stage, nextStage, status = 'waiting') {
+    const existing = await this.patientJourney
+      .where('patient_local_id')
+      .equals(patientLocalId)
+      .first();
+    
+    const now = new Date().toISOString();
+    const deviceId = this.getDeviceId();
+    
+    if (existing) {
+      const newVersion = (existing.version || 0) + 1;
+      await this.patientJourney.update(existing.id, {
+        current_stage: stage,
+        next_stage: nextStage,
+        status: status,
+        sync_status: 'pending',
+        version: newVersion,
+        updated_at: now
+      });
+      // Queue by patient_local_id (string) for backend sync
+      await this.queueForSync('patientJourney', existing.patient_local_id, 1);
+    } else {
+      await this.patientJourney.add({
+        patient_local_id: patientLocalId,
+        current_stage: stage,
+        next_stage: nextStage,
+        status: status,
+        sync_status: 'pending',
+        device_id: deviceId,
+        version: 1,
+        created_at: now,
+        updated_at: now
+      });
+      // Queue by patient_local_id (string) for backend sync
+      await this.queueForSync('patientJourney', patientLocalId, 1);
+    }
   }
 
-  setDepartment(dept) {
-    localStorage.setItem('department', dept);
+  async getPatientsAtStage(stage) {
+    const journeys = await this.patientJourney
+      .where('current_stage')
+      .equals(stage)
+      .and(j => j.status === 'waiting' || j.status === 'in-progress')
+      .toArray();
+    
+    const patients = [];
+    for (const journey of journeys) {
+      const patient = await this.patients.get(journey.patient_local_id);
+      if (patient) {
+        const encounters = await this.encounters
+          .where('patient_local_id')
+          .equals(journey.patient_local_id)
+          .toArray();
+        
+        const lastEncounter = encounters
+          .filter(e => e.encounter_type === stage)
+          .sort((a, b) => new Date(b.created_at || b.updated_at) - new Date(a.created_at || a.updated_at))[0];
+        
+        patients.push({
+          ...patient,
+          journey: journey,
+          lastEncounter: lastEncounter,
+          allEncounters: encounters
+        });
+      }
+    }
+    return patients;
   }
 
-  // Get patients who need triage (registered today, no triage encounter)
-  async getPatientsNeedingTriage() {
-    const today = new Date().toISOString().split('T')[0];
-    const allPatients = await this.patients
-      .where('updated_at')
-      .startsWith(today)
+  async getPatientsForStage(stage) {
+    const journeys = await this.patientJourney
+      .where('next_stage')
+      .equals(stage)
+      .and(j => j.status === 'waiting')
       .toArray();
     
-    const triageEncounters = await this.encounters
-      .where('encounter_type')
-      .equals('triage')
-      .toArray();
-    
-    const triagedPatientIds = new Set(triageEncounters.map(e => e.patient_local_id));
-    
-    return allPatients.filter(p => !triagedPatientIds.has(p.local_id));
+    const patients = [];
+    for (const journey of journeys) {
+      const patient = await this.patients.get(journey.patient_local_id);
+      if (patient) {
+        const encounters = await this.encounters
+          .where('patient_local_id')
+          .equals(journey.patient_local_id)
+          .toArray();
+        
+        patients.push({
+          ...patient,
+          journey: journey,
+          encounters: encounters.sort((a, b) => new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at))
+        });
+      }
+    }
+    return patients;
   }
 
-  // Get patients ready for doctor (triaged today, no consultation)
-  async getPatientsForDoctor() {
-    const today = new Date().toISOString().split('T')[0];
+  async completeStage(patientLocalId, nextStage) {
+    const journey = await this.patientJourney
+      .where('patient_local_id')
+      .equals(patientLocalId)
+      .first();
     
-    const triageEncounters = await this.encounters
-      .where('encounter_type')
-      .equals('triage')
-      .toArray();
-    
-    const consultationEncounters = await this.encounters
-      .where('encounter_type')
-      .equals('consultation')
-      .toArray();
-    
-    const consultedPatientIds = new Set(consultationEncounters.map(e => e.patient_local_id));
-    
-    return triageEncounters.filter(e => !consultedPatientIds.has(e.patient_local_id));
+    if (journey) {
+      const newVersion = (journey.version || 0) + 1;
+      await this.patientJourney.update(journey.id, {
+        current_stage: journey.next_stage,
+        next_stage: nextStage,
+        status: 'waiting',
+        sync_status: 'pending',
+        version: newVersion,
+        updated_at: new Date().toISOString()
+      });
+      // FIXED: Use patient_local_id (string) not local_id (number)
+      await this.queueForSync('patientJourney', journey.patient_local_id, 1);
+    }
   }
 
-  // Get full patient journey
-  async getPatientJourney(patientLocalId) {
+  async getPatientJourneyStatus(patientLocalId) {
+    const journey = await this.patientJourney
+      .where('patient_local_id')
+      .equals(patientLocalId)
+      .first();
+    
+    if (!journey) return null;
+    
     const patient = await this.patients.get(patientLocalId);
     const encounters = await this.encounters
       .where('patient_local_id')
       .equals(patientLocalId)
-      .sortBy('updated_at');
+      .toArray();
     
-    return { patient, encounters };
+    return {
+      patient,
+      journey,
+      encounters: encounters.sort((a, b) => new Date(a.created_at || a.updated_at) - new Date(b.created_at || b.updated_at))
+    };
   }
 }
 

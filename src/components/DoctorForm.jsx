@@ -1,42 +1,42 @@
- import { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { db } from '../db/schema';
 
 export default function DoctorForm() {
-  const [triageList, setTriageList] = useState([]);
-  const [selectedEncounter, setSelectedEncounter] = useState(null);
-  const [patientData, setPatientData] = useState(null);
+  const [patients, setPatients] = useState([]);
+  const [selectedPatient, setSelectedPatient] = useState(null);
   const [saved, setSaved] = useState(false);
+  const [message, setMessage] = useState('');
 
   useEffect(() => {
-    loadTriageList();
+    loadPatients();
   }, []);
 
-  const loadTriageList = async () => {
-    const needingConsultation = await db.getPatientsForDoctor();
-    setTriageList(needingConsultation);
-  };
-
-  const handleSelect = async (encounter) => {
-    setSelectedEncounter(encounter);
-    const journey = await db.getPatientJourney(encounter.patient_local_id);
-    setPatientData(journey);
+  const loadPatients = async () => {
+    // Get patients sent to doctor (from triage OR from lab)
+    const doctorPatients = await db.getPatientsForStage('consultation');
+    setPatients(doctorPatients);
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!selectedEncounter) return;
+    if (!selectedPatient) return;
 
     const form = e.target;
     const localId = db.generateTempId('ENC-CON');
     const deviceId = db.getDeviceId();
     const now = new Date().toISOString();
 
+    // Find parent encounter (lab if exists, otherwise triage)
+    const labEncounter = selectedPatient.encounters.find(e => e.encounter_type === 'lab');
+    const triageEncounter = selectedPatient.encounters.find(e => e.encounter_type === 'triage');
+    const parentId = labEncounter?.local_id || triageEncounter?.local_id || null;
+
     const encounter = {
       local_id: localId,
       server_id: null,
-      patient_local_id: selectedEncounter.patient_local_id,
+      patient_local_id: selectedPatient.local_id,
       encounter_type: 'consultation',
-      parent_encounter_id: selectedEncounter.local_id,
+      parent_encounter_id: parentId,
       diagnosis_codes: form.diagnosis.value,
       notes: form.notes.value,
       prescriptions_json: JSON.stringify([{
@@ -56,17 +56,22 @@ export default function DoctorForm() {
 
     try {
       await db.encounters.add(encounter);
+      
+      // Update journey: doctor completed → next is pharmacy
+      await db.completeStage(selectedPatient.local_id, 'pharmacy');
+      
       await db.queueForSync('encounters', localId, 2);
       
       setSaved(true);
-      setSelectedEncounter(null);
-      setPatientData(null);
+      setMessage(`✓ Diagnosis saved for ${selectedPatient.name}! Sent to pharmacy.`);
+      
       setTimeout(() => {
         setSaved(false);
-        loadTriageList();
-      }, 1500);
+        setSelectedPatient(null);
+        loadPatients();
+      }, 2000);
     } catch (err) {
-      alert('Error saving consultation: ' + err.message);
+      setMessage('Error: ' + err.message);
     }
   };
 
@@ -74,71 +79,100 @@ export default function DoctorForm() {
     try { return JSON.parse(json || '{}'); } catch { return {}; }
   };
 
+  const parsePrescriptions = (json) => {
+    try { return JSON.parse(json || '[]'); } catch { return []; }
+  };
+
   return (
     <div className="max-w-2xl mx-auto p-4">
       <h2 className="text-xl font-bold mb-4 text-gray-800">Doctor Consultation</h2>
       
-      {saved && (
-        <div className="mb-4 p-3 bg-green-100 text-green-800 rounded text-sm">
-          ✓ Consultation saved. Patient can proceed to pharmacy.
+      {message && (
+        <div className={`mb-4 p-3 rounded text-sm ${message.includes('Error') ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
+          {message}
         </div>
       )}
 
-      {!selectedEncounter ? (
+      {!selectedPatient ? (
         <div>
-          <p className="text-sm text-gray-600 mb-3">Patients ready for consultation (triaged today):</p>
+          <p className="text-sm text-gray-600 mb-3">Patients ready for consultation:</p>
           <div className="space-y-2">
-            {triageList.length === 0 && (
+            {patients.length === 0 && (
               <p className="text-gray-500 text-center py-8">No patients waiting for doctor.</p>
             )}
-            {triageList.map(enc => (
-              <button
-                key={enc.local_id}
-                onClick={() => handleSelect(enc)}
-                className="w-full p-3 bg-white rounded shadow border-l-4 border-yellow-500 text-left hover:bg-yellow-50"
-              >
-                <div className="flex justify-between">
-                  <span className="font-semibold">Patient ID: {enc.patient_local_id}</span>
-                  <span className={`px-2 py-1 rounded text-xs font-medium ${
-                    enc.priority === 'red' ? 'bg-red-100 text-red-800' :
-                    enc.priority === 'yellow' ? 'bg-yellow-100 text-yellow-800' :
-                    'bg-green-100 text-green-800'
-                  }`}>
-                    {enc.priority?.toUpperCase() || 'GREEN'}
-                  </span>
-                </div>
-                <div className="text-sm text-gray-600 mt-1">
-                  Complaint: {enc.chief_complaint}
-                </div>
-                <div className="text-xs text-gray-500 mt-1">
-                  Triage time: {new Date(enc.created_at).toLocaleTimeString('en-KE')}
-                </div>
-              </button>
-            ))}
+            {patients.map(p => {
+              const triage = p.encounters.find(e => e.encounter_type === 'triage');
+              const lab = p.encounters.find(e => e.encounter_type === 'lab');
+              const vitals = parseVitals(triage?.vitals_json);
+              const labResults = parseVitals(lab?.vitals_json);
+              
+              return (
+                <button
+                  key={p.local_id}
+                  onClick={() => setSelectedPatient(p)}
+                  className="w-full p-4 bg-white rounded shadow border-l-4 border-green-500 text-left hover:bg-green-50"
+                >
+                  <div className="flex justify-between">
+                    <div>
+                      <div className="font-bold text-lg">{p.name}</div>
+                      <div className="text-sm text-gray-600">
+                        {triage?.chief_complaint}
+                      </div>
+                      <div className="flex gap-2 mt-1">
+                        <span className="px-2 py-1 bg-yellow-100 text-yellow-800 rounded text-xs">
+                          BP: {vitals.bp || '-'} | Temp: {vitals.temp || '-'}
+                        </span>
+                        {lab && (
+                          <span className="px-2 py-1 bg-indigo-100 text-indigo-800 rounded text-xs">
+                            Lab: Malaria {labResults.malaria_rdt || '-'} | Hb {labResults.hb || '-'}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <span className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-xs font-medium self-center">
+                      {lab ? 'From Lab' : 'From Triage'}
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
           </div>
         </div>
       ) : (
         <div>
-          {/* Patient Summary Card */}
-          {patientData && (
-            <div className="mb-4 p-4 bg-blue-50 rounded-lg">
-              <h3 className="font-bold text-gray-800">{patientData.patient?.name}</h3>
-              <p className="text-sm text-gray-600">
-                {patientData.patient?.phone} | {patientData.patient?.gender} | {patientData.patient?.county}
-              </p>
-              
-              {patientData.encounters?.filter(e => e.encounter_type === 'triage').map(triage => (
-                <div key={triage.local_id} className="mt-2 p-2 bg-white rounded text-sm">
-                  <strong>Triage Vitals:</strong><br/>
-                  {(() => {
-                    const v = parseVitals(triage.vitals_json);
-                    return `BP: ${v.bp || '-'} | Temp: ${v.temp || '-'}°C | Weight: ${v.weight || '-'}kg | SpO2: ${v.spo2 || '-'}%`;
-                  })()}<br/>
-                  <strong>Complaint:</strong> {triage.chief_complaint}
+          {/* Patient Summary */}
+          <div className="mb-4 p-4 bg-green-50 rounded-lg">
+            <h3 className="font-bold text-gray-800">{selectedPatient.name}</h3>
+            <p className="text-sm text-gray-600">
+              {selectedPatient.phone} | {selectedPatient.gender} | {selectedPatient.county}
+            </p>
+            
+            {(() => {
+              const triage = selectedPatient.encounters.find(e => e.encounter_type === 'triage');
+              const vitals = parseVitals(triage?.vitals_json);
+              return (
+                <div className="mt-2 p-2 bg-white rounded text-sm">
+                  <strong>Triage Vitals:</strong> BP {vitals.bp || '-'} | Temp {vitals.temp || '-'}°C | 
+                  Weight {vitals.weight || '-'}kg | SpO2 {vitals.spo2 || '-'}%<br/>
+                  <strong>Complaint:</strong> {triage?.chief_complaint}
                 </div>
-              ))}
-            </div>
-          )}
+              );
+            })()}
+
+            {(() => {
+              const lab = selectedPatient.encounters.find(e => e.encounter_type === 'lab');
+              if (!lab) return null;
+              const results = parseVitals(lab.vitals_json);
+              return (
+                <div className="mt-2 p-2 bg-indigo-50 rounded text-sm">
+                  <strong>Lab Results:</strong><br/>
+                  Malaria RDT: {results.malaria_rdt || '-'} | Hb: {results.hb || '-'} g/dL | 
+                  WBC: {results.wbc || '-'} | Blood Group: {results.blood_group || '-'}<br/>
+                  <strong>Notes:</strong> {lab.notes || 'None'}
+                </div>
+              );
+            })()}
+          </div>
 
           <form onSubmit={handleSubmit} className="space-y-3">
             <div>
@@ -182,16 +216,16 @@ export default function DoctorForm() {
             <div className="flex gap-3">
               <button 
                 type="button"
-                onClick={() => { setSelectedEncounter(null); setPatientData(null); }}
-                className="flex-1 py-2 px-4 bg-gray-500 text-white rounded hover:bg-gray-600"
+                onClick={() => setSelectedPatient(null)}
+                className="flex-1 py-2 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
               >
                 Back to List
               </button>
               <button 
                 type="submit"
-                className="flex-1 py-2 px-4 bg-green-600 text-white rounded hover:bg-green-700 font-medium"
+                className="flex-1 py-2 bg-green-600 text-white rounded hover:bg-green-700 font-medium"
               >
-                Save Consultation
+                Save & Send to Pharmacy
               </button>
             </div>
           </form>
