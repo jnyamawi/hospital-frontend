@@ -6,15 +6,31 @@ export default function DoctorForm() {
   const [selectedPatient, setSelectedPatient] = useState(null);
   const [saved, setSaved] = useState(false);
   const [message, setMessage] = useState('');
+  const [drugs, setDrugs] = useState([{ drug: '', qty: '', dosage: '' }]);
 
   useEffect(() => {
     loadPatients();
   }, []);
 
   const loadPatients = async () => {
-    // Get patients sent to doctor (from triage OR from lab)
     const doctorPatients = await db.getPatientsForStage('consultation');
     setPatients(doctorPatients);
+  };
+
+  const handleAddDrug = () => {
+    setDrugs([...drugs, { drug: '', qty: '', dosage: '' }]);
+  };
+
+  const handleRemoveDrug = (index) => {
+    if (drugs.length === 1) return;
+    const newDrugs = drugs.filter((_, i) => i !== index);
+    setDrugs(newDrugs);
+  };
+
+  const handleDrugChange = (index, field, value) => {
+    const newDrugs = [...drugs];
+    newDrugs[index][field] = value;
+    setDrugs(newDrugs);
   };
 
   const handleSubmit = async (e) => {
@@ -26,7 +42,13 @@ export default function DoctorForm() {
     const deviceId = db.getDeviceId();
     const now = new Date().toISOString();
 
-    // Find parent encounter (lab if exists, otherwise triage)
+    const validDrugs = drugs.filter(d => d.drug.trim() !== '');
+    
+    if (validDrugs.length === 0) {
+      setMessage('Error: Please add at least one drug');
+      return;
+    }
+
     const labEncounter = selectedPatient.encounters.find(e => e.encounter_type === 'lab');
     const triageEncounter = selectedPatient.encounters.find(e => e.encounter_type === 'triage');
     const parentId = labEncounter?.local_id || triageEncounter?.local_id || null;
@@ -39,11 +61,7 @@ export default function DoctorForm() {
       parent_encounter_id: parentId,
       diagnosis_codes: form.diagnosis.value,
       notes: form.notes.value,
-      prescriptions_json: JSON.stringify([{
-        drug: form.drug.value,
-        qty: parseInt(form.qty.value),
-        dosage: form.dosage.value
-      }]),
+      prescriptions_json: JSON.stringify(validDrugs),
       department_code: 'DOC-01',
       facility_code: localStorage.getItem('facility_code') || 'DEMO-FAC-001',
       clinician_id: form.doctor_id.value,
@@ -56,10 +74,7 @@ export default function DoctorForm() {
 
     try {
       await db.encounters.add(encounter);
-      
-      // Update journey: doctor completed → next is pharmacy
       await db.completeStage(selectedPatient.local_id, 'pharmacy');
-      
       await db.queueForSync('encounters', localId, 2);
       
       setSaved(true);
@@ -68,6 +83,7 @@ export default function DoctorForm() {
       setTimeout(() => {
         setSaved(false);
         setSelectedPatient(null);
+        setDrugs([{ drug: '', qty: '', dosage: '' }]);
         loadPatients();
       }, 2000);
     } catch (err) {
@@ -77,10 +93,6 @@ export default function DoctorForm() {
 
   const parseVitals = (json) => {
     try { return JSON.parse(json || '{}'); } catch { return {}; }
-  };
-
-  const parsePrescriptions = (json) => {
-    try { return JSON.parse(json || '[]'); } catch { return []; }
   };
 
   return (
@@ -140,7 +152,6 @@ export default function DoctorForm() {
         </div>
       ) : (
         <div>
-          {/* Patient Summary */}
           <div className="mb-4 p-4 bg-green-50 rounded-lg">
             <h3 className="font-bold text-gray-800">{selectedPatient.name}</h3>
             <p className="text-sm text-gray-600">
@@ -188,22 +199,64 @@ export default function DoctorForm() {
                 placeholder="Examination findings, plan..."></textarea>
             </div>
 
-            <div className="grid grid-cols-3 gap-3">
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Drug *</label>
-                <input name="drug" required
-                  className="w-full mt-1 p-2 border rounded" />
+            {/* Multi-Drug Prescription Section */}
+            <div className="border rounded-lg p-4 bg-gray-50">
+              <div className="flex justify-between items-center mb-3">
+                <label className="block text-sm font-medium text-gray-700">Prescriptions *</label>
+                <button
+                  type="button"
+                  onClick={handleAddDrug}
+                  className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+                >
+                  + Add Drug
+                </button>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Qty *</label>
-                <input name="qty" required type="number"
-                  className="w-full mt-1 p-2 border rounded" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Dosage *</label>
-                <input name="dosage" required placeholder="500mg TDS"
-                  className="w-full mt-1 p-2 border rounded" />
-              </div>
+              
+              {drugs.map((drug, index) => (
+                <div key={index} className="grid grid-cols-12 gap-2 mb-2 items-end">
+                  <div className="col-span-4">
+                    <input
+                      type="text"
+                      value={drug.drug}
+                      onChange={(e) => handleDrugChange(index, 'drug', e.target.value)}
+                      placeholder="Drug name"
+                      className="w-full p-2 border rounded text-sm"
+                      required
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    <input
+                      type="number"
+                      value={drug.qty}
+                      onChange={(e) => handleDrugChange(index, 'qty', e.target.value)}
+                      placeholder="Qty"
+                      className="w-full p-2 border rounded text-sm"
+                      required
+                    />
+                  </div>
+                  <div className="col-span-4">
+                    <input
+                      type="text"
+                      value={drug.dosage}
+                      onChange={(e) => handleDrugChange(index, 'dosage', e.target.value)}
+                      placeholder="e.g., 500mg TDS"
+                      className="w-full p-2 border rounded text-sm"
+                      required
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    {drugs.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveDrug(index)}
+                        className="w-full py-2 bg-red-100 text-red-600 rounded text-sm hover:bg-red-200"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
 
             <div>
@@ -216,7 +269,10 @@ export default function DoctorForm() {
             <div className="flex gap-3">
               <button 
                 type="button"
-                onClick={() => setSelectedPatient(null)}
+                onClick={() => {
+                  setSelectedPatient(null);
+                  setDrugs([{ drug: '', qty: '', dosage: '' }]);
+                }}
                 className="flex-1 py-2 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
               >
                 Back to List

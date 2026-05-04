@@ -8,7 +8,25 @@ export default function LabForm() {
   const [message, setMessage] = useState('');
 
   useEffect(() => {
+    // Initial load
     loadPatients();
+    
+    // CRITICAL: Sync on mount to pull patients from other devices
+    const syncOnMount = async () => {
+      if (window.syncHook && window.syncHook.performSync) {
+        console.log('LabForm: Syncing on mount...');
+        await window.syncHook.performSync();
+        loadPatients(); // Reload after sync
+      }
+    };
+    syncOnMount();
+    
+    // Auto-refresh every 5 seconds to catch updates from other devices
+    const refreshInterval = setInterval(() => {
+      loadPatients();
+    }, 5000);
+    
+    return () => clearInterval(refreshInterval);
   }, []);
 
   const loadPatients = async () => {
@@ -59,6 +77,11 @@ export default function LabForm() {
       
       // Update journey: lab completed → next is doctor
       await db.completeStage(selectedPatient.local_id, 'consultation');
+      
+      // CRITICAL: Immediate sync to push to server so doctor sees it
+      if (window.syncHook && window.syncHook.performSync) {
+        await window.syncHook.performSync();
+      }
       
       setSaved(true);
       setMessage(`✓ Lab results saved for ${selectedPatient.name}! Sent to doctor.`);

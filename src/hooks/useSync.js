@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { db } from '../db/schema';
+import { API_BASE } from '../config';
 
-const API_BASE = 'http://localhost:8000';
 const DEVICE_ID = db.getDeviceId();
 
 const SYNC_PRIORITY = {
@@ -129,7 +129,7 @@ export function useSync() {
         }
       }
       
-      // PULL from server
+      // PULL from server — always run this even if no local data to push
       const lastSyncTime = lastSync || '1970-01-01T00:00:00Z';
       console.log('Pulling since:', lastSyncTime);
       
@@ -174,12 +174,20 @@ export function useSync() {
               });
               console.log(`  ✓ Added new patientJourney for ${patientLocalId}`);
             } else {
-              await table.update(existing.id, { 
-                ...change.data, 
-                sync_status: 'synced',
-                updated_at: change.data.updated_at || new Date().toISOString()
-              });
-              console.log(`  ✓ Updated patientJourney for ${patientLocalId}`);
+              // FIXED: Always update if server data is newer by timestamp, not just version
+              const serverTime = new Date(change.data.updated_at || 0);
+              const localTime = new Date(existing.updated_at || 0);
+              
+              if (serverTime > localTime || (change.data.version || 0) > (existing.version || 0)) {
+                await table.update(existing.id, { 
+                  ...change.data, 
+                  sync_status: 'synced',
+                  updated_at: change.data.updated_at || new Date().toISOString()
+                });
+                console.log(`  ✓ Updated patientJourney for ${patientLocalId}`);
+              } else {
+                console.log(`  → Already up to date`);
+              }
             }
           } else {
             // Normal handling for patients, encounters, bills
@@ -188,11 +196,17 @@ export function useSync() {
             if (!localRecord) {
               await table.add({ ...change.data, sync_status: 'synced' });
               console.log(`  ✓ Added new ${tableName}`);
-            } else if (localRecord.version < change.data.version) {
-              await table.put({ ...change.data, sync_status: 'synced' });
-              console.log(`  ✓ Updated ${tableName}`);
             } else {
-              console.log(`  → Already up to date`);
+              // FIXED: Compare by updated_at timestamp for reliability
+              const serverTime = new Date(change.data.updated_at || 0);
+              const localTime = new Date(localRecord.updated_at || 0);
+              
+              if (serverTime > localTime || (change.data.version || 0) > (localRecord.version || 0)) {
+                await table.put({ ...change.data, sync_status: 'synced' });
+                console.log(`  ✓ Updated ${tableName}`);
+              } else {
+                console.log(`  → Already up to date`);
+              }
             }
           }
         }
@@ -214,11 +228,47 @@ export function useSync() {
     }
   }, [isOnline, isSyncing, lastSync]);
 
+  // Auto-sync when we have pending data to push
   useEffect(() => {
     if (isOnline && pendingCount > 0) {
       performSync();
     }
   }, [isOnline, pendingCount, performSync]);
+
+  // Auto-pull every 30 seconds when online (even if no pending data)
+  useEffect(() => {
+    if (!isOnline) return;
+    
+    const interval = setInterval(() => {
+      console.log('Auto-pull interval triggered');
+      performSync();
+    }, 30000); // Every 30 seconds
+    
+    return () => clearInterval(interval);
+  }, [isOnline, performSync]);
+
+  // Pull when window regains focus (user switches back to tab)
+  useEffect(() => {
+    const handleFocus = () => {
+      if (isOnline) {
+        console.log('Window focused - triggering sync');
+        performSync();
+      }
+    };
+    
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [isOnline, performSync]);
+
+  // CRITICAL FIX: Expose sync function globally for immediate cross-device updates
+  useEffect(() => {
+    window.syncHook = { performSync };
+    console.log('useSync: window.syncHook registered');
+    return () => { 
+      delete window.syncHook; 
+      console.log('useSync: window.syncHook removed');
+    };
+  }, [performSync]);
 
   return {
     isOnline,

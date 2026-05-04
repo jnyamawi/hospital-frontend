@@ -4,8 +4,8 @@ class HospitalDB extends Dexie {
   constructor() {
     super('HospitalDB');
     
-    // Version 6: Force recreate with all fixes applied
-    this.version(6).stores({
+    // Version 7: Fix completeStage to set status='completed' for finished journeys
+    this.version(7).stores({
       patients: '++local_id, server_id, national_id, phone, name, facility_code, sync_status, device_id, version, updated_at',
       encounters: '++local_id, server_id, patient_local_id, encounter_type, parent_encounter_id, department_code, facility_code, sync_status, device_id, version, updated_at',
       bills: '++local_id, server_id, encounter_local_id, payment_status, sync_status, device_id, version, updated_at',
@@ -45,10 +45,22 @@ class HospitalDB extends Dexie {
     });
   }
 
+  // FIXED: crypto.randomUUID is not available on non-secure contexts (HTTP over network)
   getDeviceId() {
     let deviceId = localStorage.getItem('device_id');
     if (!deviceId) {
-      deviceId = `DEV-${crypto.randomUUID().substring(0, 8)}`;
+      const generateUUID = () => {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+          return crypto.randomUUID();
+        }
+        // Manual UUID v4 generation for HTTP/non-secure contexts
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+          const r = Math.random() * 16 | 0;
+          const v = c === 'x' ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      };
+      deviceId = `DEV-${generateUUID().substring(0, 8)}`;
       localStorage.setItem('device_id', deviceId);
     }
     return deviceId;
@@ -151,6 +163,7 @@ class HospitalDB extends Dexie {
     return patients;
   }
 
+  // FIXED: completeStage now sets status='completed' when journey is finished
   async completeStage(patientLocalId, nextStage) {
     const journey = await this.patientJourney
       .where('patient_local_id')
@@ -159,14 +172,19 @@ class HospitalDB extends Dexie {
     
     if (journey) {
       const newVersion = (journey.version || 0) + 1;
+      
+      // Determine if this is the final stage of the journey
+      const isFinalStage = nextStage === 'completed' || nextStage === 'done' || nextStage === 'finished';
+      
       await this.patientJourney.update(journey.id, {
-        current_stage: journey.next_stage,
-        next_stage: nextStage,
-        status: 'waiting',
+        current_stage: journey.next_stage,      // e.g., pharmacy → becomes current
+        next_stage: nextStage,                   // 'completed' → becomes next
+        status: isFinalStage ? 'completed' : 'waiting',  // ← FIX: completed when done
         sync_status: 'pending',
         version: newVersion,
         updated_at: new Date().toISOString()
       });
+      
       // FIXED: Use patient_local_id (string) not local_id (number)
       await this.queueForSync('patientJourney', journey.patient_local_id, 1);
     }

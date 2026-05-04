@@ -14,7 +14,6 @@ function AppContent() {
   const { user, logout, hasRole, loading } = useAuth();
   const [activeTab, setActiveTab] = useState('register');
 
-  // Fix: useEffect instead of useState for side effects
   useEffect(() => {
     if (user) {
       const tabs = [];
@@ -28,12 +27,11 @@ function AppContent() {
       if (hasRole(['admin', 'pharmacist'])) tabs.push('pharmacy');
       if (hasRole(['admin'])) tabs.push('admin');
       
-      // If current activeTab is not in available tabs, switch to first available
       if (tabs.length > 0 && !tabs.includes(activeTab)) {
         setActiveTab(tabs[0]);
       }
     }
-  }, [user]); // Run when user changes
+  }, [user]);
 
   if (loading) {
     return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
@@ -69,7 +67,6 @@ function AppContent() {
 
   const tabs = [];
 
-  // Build tabs based on role
   if (hasRole(['admin', 'receptionist'])) {
     tabs.push({ id: 'register', label: 'Patient Reception', component: <PatientForm /> });
     tabs.push({ id: 'list', label: 'View Records', component: <PatientList /> });

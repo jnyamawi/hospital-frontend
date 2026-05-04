@@ -1,4 +1,4 @@
- import { useSync } from '../hooks/useSync';
+import { useSync } from '../hooks/useSync';
 
 export default function SyncStatus() {
   const { isOnline, isSyncing, lastSync, pendingCount, syncError, performSync } = useSync();
@@ -27,10 +27,10 @@ export default function SyncStatus() {
       
       <button
         onClick={performSync}
-        disabled={!isOnline || isSyncing || pendingCount === 0}
+        disabled={!isOnline || isSyncing}  // ← FIXED: can sync even with 0 pending
         className="mt-3 w-full py-2 px-3 bg-blue-600 text-white text-sm rounded hover:bg-blue-700 disabled:opacity-50"
       >
-        {isSyncing ? 'Syncing...' : 'Sync Now'}
+        {isSyncing ? 'Syncing...' : pendingCount > 0 ? `Sync Now (${pendingCount})` : 'Pull Data'}
       </button>
     </div>
   );
