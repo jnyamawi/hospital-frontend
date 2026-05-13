@@ -6,22 +6,25 @@ export default function LabForm() {
   const [selectedPatient, setSelectedPatient] = useState(null);
   const [saved, setSaved] = useState(false);
   const [message, setMessage] = useState('');
+  const [currentTechId, setCurrentTechId] = useState('');
 
   useEffect(() => {
-    // Initial load
+    const techId = localStorage.getItem('user_staff_id') || 'UNKNOWN';
+    setCurrentTechId(techId);
+  }, []);
+
+  useEffect(() => {
     loadPatients();
     
-    // CRITICAL: Sync on mount to pull patients from other devices
     const syncOnMount = async () => {
       if (window.syncHook && window.syncHook.performSync) {
         console.log('LabForm: Syncing on mount...');
         await window.syncHook.performSync();
-        loadPatients(); // Reload after sync
+        loadPatients();
       }
     };
     syncOnMount();
     
-    // Auto-refresh every 5 seconds to catch updates from other devices
     const refreshInterval = setInterval(() => {
       loadPatients();
     }, 5000);
@@ -30,9 +33,42 @@ export default function LabForm() {
   }, []);
 
   const loadPatients = async () => {
-    // Get patients whose next stage is 'lab'
     const labPatients = await db.getPatientsForStage('lab');
     setPatients(labPatients);
+  };
+
+  const handleSelectPatient = async (patient) => {
+    const techId = currentTechId || localStorage.getItem('user_staff_id') || 'UNKNOWN';
+    
+    // If already locked by me, just open it (no need to re-lock)
+    if (patient.journey?.locked_by === techId) {
+      setSelectedPatient(patient);
+      return;
+    }
+    
+    const locked = await db.lockPatient(patient.local_id, techId);
+    
+    if (!locked) {
+      await loadPatients();
+      setMessage(`Patient ${patient.name} is already being processed by ${patient.journey.locked_by}`);
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    
+    setSelectedPatient(patient);
+    if (window.syncHook?.performSync) {
+      await window.syncHook.performSync();
+    }
+  };
+
+  const handleBack = async () => {
+    if (selectedPatient) {
+      await db.unlockPatient(selectedPatient.local_id);
+      if (window.syncHook?.performSync) {
+        await window.syncHook.performSync();
+      }
+    }
+    setSelectedPatient(null);
   };
 
   const handleSubmit = async (e) => {
@@ -44,7 +80,6 @@ export default function LabForm() {
     const deviceId = db.getDeviceId();
     const now = new Date().toISOString();
 
-    // Get triage encounter as parent
     const triageEncounter = selectedPatient.encounters.find(e => e.encounter_type === 'triage');
 
     const encounter = {
@@ -74,11 +109,8 @@ export default function LabForm() {
     try {
       await db.encounters.add(encounter);
       await db.queueForSync('encounters', localId, 2);
-      
-      // Update journey: lab completed → next is doctor
       await db.completeStage(selectedPatient.local_id, 'consultation');
       
-      // CRITICAL: Immediate sync to push to server so doctor sees it
       if (window.syncHook && window.syncHook.performSync) {
         await window.syncHook.performSync();
       }
@@ -94,6 +126,47 @@ export default function LabForm() {
     } catch (err) {
       setMessage('Error: ' + err.message);
     }
+  };
+
+  const getStatusDisplay = (patient) => {
+    const journey = patient.journey;
+    const isLockedByMe = journey.locked_by === currentTechId;
+    
+    // Locked by SOMEONE ELSE
+    if (journey.status === 'in-progress' && journey.locked_by && !isLockedByMe) {
+      return {
+        text: `Processing by ${journey.locked_by}`,
+        class: 'bg-orange-100 text-orange-800',
+        disabled: true,
+        borderColor: 'border-gray-300'
+      };
+    }
+    
+    // Locked by ME
+    if (journey.status === 'in-progress' && journey.locked_by && isLockedByMe) {
+      return {
+        text: 'Continue 🔒',
+        class: 'bg-blue-100 text-blue-800',
+        disabled: false,
+        borderColor: 'border-blue-500'
+      };
+    }
+    
+    if (journey.status === 'waiting') {
+      return {
+        text: 'Run Tests',
+        class: 'bg-indigo-100 text-indigo-800',
+        disabled: false,
+        borderColor: 'border-indigo-500'
+      };
+    }
+    
+    return {
+      text: journey.status,
+      class: 'bg-gray-100 text-gray-800',
+      disabled: true,
+      borderColor: 'border-gray-300'
+    };
   };
 
   const parseVitals = (json) => {
@@ -120,14 +193,20 @@ export default function LabForm() {
             {patients.map(p => {
               const triage = p.encounters.find(e => e.encounter_type === 'triage');
               const vitals = parseVitals(triage?.vitals_json);
+              const status = getStatusDisplay(p);
               
               return (
                 <button
                   key={p.local_id}
-                  onClick={() => setSelectedPatient(p)}
-                  className="w-full p-4 bg-white rounded shadow border-l-4 border-indigo-500 text-left hover:bg-indigo-50"
+                  onClick={() => !status.disabled && handleSelectPatient(p)}
+                  disabled={status.disabled}
+                  className={`w-full p-4 bg-white rounded shadow border-l-4 text-left transition-all ${
+                    status.disabled 
+                      ? `${status.borderColor} opacity-60 cursor-not-allowed` 
+                      : `${status.borderColor} hover:bg-indigo-50 cursor-pointer`
+                  }`}
                 >
-                  <div className="flex justify-between">
+                  <div className="flex justify-between items-center">
                     <div>
                       <div className="font-bold text-lg">{p.name}</div>
                       <div className="text-sm text-gray-600">
@@ -136,9 +215,19 @@ export default function LabForm() {
                       <div className="text-xs text-gray-500 mt-1">
                         Vitals: BP {vitals.bp || '-'} | Temp {vitals.temp || '-'}°C
                       </div>
+                      {p.journey?.locked_by && p.journey.locked_by !== currentTechId && (
+                        <div className="text-xs text-orange-600 mt-1 font-medium">
+                          🔒 Being processed by: {p.journey.locked_by}
+                        </div>
+                      )}
+                      {p.journey?.locked_by && p.journey.locked_by === currentTechId && (
+                        <div className="text-xs text-blue-600 mt-1 font-medium">
+                          🔒 You are processing this patient
+                        </div>
+                      )}
                     </div>
-                    <span className="px-3 py-1 bg-indigo-100 text-indigo-800 rounded-full text-xs font-medium self-center">
-                      Run Tests
+                    <span className={`px-3 py-1 rounded-full text-xs font-medium ${status.class}`}>
+                      {status.text}
                     </span>
                   </div>
                 </button>
@@ -148,17 +237,22 @@ export default function LabForm() {
         </div>
       ) : (
         <div>
-          <div className="mb-4 p-3 bg-indigo-50 rounded">
-            <div className="font-bold">{selectedPatient.name}</div>
-            <div className="text-sm text-gray-600">{selectedPatient.phone} | {selectedPatient.gender}</div>
-            {(() => {
-              const triage = selectedPatient.encounters.find(e => e.encounter_type === 'triage');
-              return (
-                <div className="text-xs text-gray-500 mt-1">
-                  Triage complaint: {triage?.chief_complaint}
-                </div>
-              );
-            })()}
+          <div className="mb-4 p-3 bg-indigo-50 rounded flex justify-between items-center">
+            <div>
+              <div className="font-bold">{selectedPatient.name}</div>
+              <div className="text-sm text-gray-600">{selectedPatient.phone} | {selectedPatient.gender}</div>
+              {(() => {
+                const triage = selectedPatient.encounters.find(e => e.encounter_type === 'triage');
+                return (
+                  <div className="text-xs text-gray-500 mt-1">
+                    Triage complaint: {triage?.chief_complaint}
+                  </div>
+                );
+              })()}
+            </div>
+            <span className="px-2 py-1 bg-orange-100 text-orange-800 rounded text-xs">
+              🔒 Locked by you
+            </span>
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-3">
@@ -226,10 +320,10 @@ export default function LabForm() {
             <div className="flex gap-3">
               <button 
                 type="button"
-                onClick={() => setSelectedPatient(null)}
+                onClick={handleBack}
                 className="flex-1 py-2 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
               >
-                Back
+                Back (Unlock Patient)
               </button>
               <button 
                 type="submit"

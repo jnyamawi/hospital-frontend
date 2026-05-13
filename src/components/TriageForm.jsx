@@ -7,15 +7,60 @@ export default function TriageForm() {
   const [selectedDestination, setSelectedDestination] = useState(null);
   const [saved, setSaved] = useState(false);
   const [message, setMessage] = useState('');
+  const [currentNurseId, setCurrentNurseId] = useState('');
 
   useEffect(() => {
     loadPatients();
+    const interval = setInterval(() => {
+      loadPatients();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const nurseId = localStorage.getItem('user_staff_id') || 'UNKNOWN';
+    setCurrentNurseId(nurseId);
   }, []);
 
   const loadPatients = async () => {
-    // FIXED: Use getPatientsForStage('triage') — patients whose NEXT stage is triage
     const waitingPatients = await db.getPatientsForStage('triage');
     setPatients(waitingPatients);
+  };
+
+  const handleSelectPatient = async (patient) => {
+    const nurseId = currentNurseId || localStorage.getItem('user_staff_id') || 'UNKNOWN';
+    
+    // If already locked by me, just open it (no need to re-lock)
+    if (patient.journey?.locked_by === nurseId) {
+      setSelectedPatient(patient);
+      return;
+    }
+    
+    // Try to lock the patient
+    const locked = await db.lockPatient(patient.local_id, nurseId);
+    
+    if (!locked) {
+      await loadPatients();
+      setMessage(`Patient ${patient.name} is already being seen by ${patient.journey.locked_by}`);
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    
+    setSelectedPatient(patient);
+    if (window.syncHook?.performSync) {
+      await window.syncHook.performSync();
+    }
+  };
+
+  const handleBack = async () => {
+    if (selectedPatient) {
+      await db.unlockPatient(selectedPatient.local_id);
+      if (window.syncHook?.performSync) {
+        await window.syncHook.performSync();
+      }
+    }
+    setSelectedPatient(null);
+    setSelectedDestination(null);
   };
 
   const handleSubmit = async (e) => {
@@ -57,12 +102,14 @@ export default function TriageForm() {
       await db.encounters.add(encounter);
       await db.queueForSync('encounters', localId, 2);
       
-      // Update patient journey: registration → triage → [lab or doctor]
-      // This also queues patientJourney for sync automatically
       await db.completeStage(
         selectedPatient.local_id,
-        selectedDestination // 'lab' or 'consultation'
+        selectedDestination
       );
+      
+      if (window.syncHook?.performSync) {
+        await window.syncHook.performSync();
+      }
       
       setSaved(true);
       setMessage(`✓ ${selectedPatient.name} triaged and sent to ${selectedDestination.toUpperCase()}!`);
@@ -76,6 +123,47 @@ export default function TriageForm() {
     } catch (err) {
       setMessage('Error: ' + err.message);
     }
+  };
+
+  const getStatusDisplay = (patient) => {
+    const journey = patient.journey;
+    const isLockedByMe = journey.locked_by === currentNurseId;
+    
+    // Patient is locked by SOMEONE ELSE
+    if (journey.status === 'in-progress' && journey.locked_by && !isLockedByMe) {
+      return {
+        text: `Being seen by ${journey.locked_by}`,
+        class: 'bg-orange-100 text-orange-800',
+        disabled: true,
+        borderColor: 'border-gray-300'
+      };
+    }
+    
+    // Patient is locked by ME (I can continue working)
+    if (journey.status === 'in-progress' && journey.locked_by && isLockedByMe) {
+      return {
+        text: 'Continue Triage 🔒',
+        class: 'bg-blue-100 text-blue-800',
+        disabled: false,
+        borderColor: 'border-blue-500'
+      };
+    }
+    
+    if (journey.status === 'waiting') {
+      return {
+        text: 'Select',
+        class: 'bg-blue-100 text-blue-800',
+        disabled: false,
+        borderColor: 'border-blue-500'
+      };
+    }
+    
+    return {
+      text: journey.status,
+      class: 'bg-gray-100 text-gray-800',
+      disabled: true,
+      borderColor: 'border-gray-300'
+    };
   };
 
   const getPriorityColor = (priority) => {
@@ -108,35 +196,58 @@ export default function TriageForm() {
             {patients.length === 0 && (
               <p className="text-gray-500 text-center py-8">No patients waiting for triage.</p>
             )}
-            {patients.map(p => (
-              <button
-                key={p.local_id}
-                onClick={() => setSelectedPatient(p)}
-                className="w-full p-4 bg-white rounded shadow border-l-4 border-blue-500 text-left hover:bg-blue-50"
-              >
-                <div className="flex justify-between">
-                  <div>
-                    <div className="font-bold text-lg">{p.name}</div>
-                    <div className="text-sm text-gray-600">
-                      ID: {p.local_id} | {p.gender} | {p.phone}
+            {patients.map(p => {
+              const status = getStatusDisplay(p);
+              return (
+                <button
+                  key={p.local_id}
+                  onClick={() => !status.disabled && handleSelectPatient(p)}
+                  disabled={status.disabled}
+                  className={`w-full p-4 bg-white rounded shadow border-l-4 text-left transition-all ${
+                    status.disabled 
+                      ? `${status.borderColor} opacity-60 cursor-not-allowed` 
+                      : `${status.borderColor} hover:bg-blue-50 cursor-pointer`
+                  }`}
+                >
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <div className="font-bold text-lg">{p.name}</div>
+                      <div className="text-sm text-gray-600">
+                        ID: {p.local_id} | {p.gender} | {p.phone}
+                      </div>
+                      <div className="text-xs text-gray-500 mt-1">
+                        Checked in: {new Date(p.journey?.updated_at || p.created_at).toLocaleTimeString('en-KE')}
+                      </div>
+                      {p.journey?.locked_by && p.journey.locked_by !== currentNurseId && (
+                        <div className="text-xs text-orange-600 mt-1 font-medium">
+                          🔒 Being attended by: {p.journey.locked_by}
+                        </div>
+                      )}
+                      {p.journey?.locked_by && p.journey.locked_by === currentNurseId && (
+                        <div className="text-xs text-blue-600 mt-1 font-medium">
+                          🔒 You are attending this patient
+                        </div>
+                      )}
                     </div>
-                    <div className="text-xs text-gray-500 mt-1">
-                      Checked in: {new Date(p.journey?.updated_at || p.created_at).toLocaleTimeString('en-KE')}
-                    </div>
+                    <span className={`px-3 py-1 rounded-full text-xs font-medium ${status.class}`}>
+                      {status.text}
+                    </span>
                   </div>
-                  <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-xs font-medium self-center">
-                    Select
-                  </span>
-                </div>
-              </button>
-            ))}
+                </button>
+              );
+            })}
           </div>
         </div>
       ) : !selectedDestination ? (
         <div className="bg-white rounded shadow p-6">
-          <div className="mb-4 p-3 bg-blue-50 rounded">
-            <div className="font-bold">{selectedPatient.name}</div>
-            <div className="text-sm text-gray-600">{selectedPatient.phone} | {selectedPatient.gender}</div>
+          <div className="mb-4 p-3 bg-blue-50 rounded flex justify-between items-center">
+            <div>
+              <div className="font-bold">{selectedPatient.name}</div>
+              <div className="text-sm text-gray-600">{selectedPatient.phone} | {selectedPatient.gender}</div>
+            </div>
+            <span className="px-2 py-1 bg-orange-100 text-orange-800 rounded text-xs">
+              🔒 Locked by you
+            </span>
           </div>
           
           <h3 className="font-semibold mb-4 text-center">Where should this patient go?</h3>
@@ -162,10 +273,10 @@ export default function TriageForm() {
           </div>
           
           <button
-            onClick={() => { setSelectedPatient(null); setSelectedDestination(null); }}
+            onClick={handleBack}
             className="w-full mt-4 py-2 text-gray-600 hover:text-gray-800"
           >
-            ← Back to Patient List
+            ← Back to Patient List (Unlock Patient)
           </button>
         </div>
       ) : (

@@ -1,4 +1,4 @@
- import { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect } from 'react';
 
 const AuthContext = createContext(null);
 
@@ -21,6 +21,11 @@ export function AuthProvider({ children }) {
   const login = (token, userData) => {
     localStorage.setItem('token', token);
     localStorage.setItem('user', JSON.stringify(userData));
+    
+    // NEW: Store staff_id and role separately for easy access
+    localStorage.setItem('user_staff_id', userData.staff_id);
+    localStorage.setItem('user_role', userData.role);
+    
     setToken(token);
     setUser(userData);
   };
@@ -28,6 +33,8 @@ export function AuthProvider({ children }) {
   const logout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('user');
+    localStorage.removeItem('user_staff_id');  // ← NEW: clear staff_id
+    localStorage.removeItem('user_role');       // ← NEW: clear role
     setToken(null);
     setUser(null);
   };

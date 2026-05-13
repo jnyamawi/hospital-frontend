@@ -4,12 +4,12 @@ class HospitalDB extends Dexie {
   constructor() {
     super('HospitalDB');
     
-    // Version 7: Fix completeStage to set status='completed' for finished journeys
-    this.version(7).stores({
+    // Version 8: Add locked_by field for multi-device locking
+    this.version(8).stores({
       patients: '++local_id, server_id, national_id, phone, name, facility_code, sync_status, device_id, version, updated_at',
       encounters: '++local_id, server_id, patient_local_id, encounter_type, parent_encounter_id, department_code, facility_code, sync_status, device_id, version, updated_at',
       bills: '++local_id, server_id, encounter_local_id, payment_status, sync_status, device_id, version, updated_at',
-      patientJourney: '++id, patient_local_id, current_stage, next_stage, status, sync_status, updated_at',
+      patientJourney: '++id, patient_local_id, current_stage, next_stage, status, locked_by, sync_status, updated_at',  // ← ADDED: locked_by index
       syncQueue: '++id, table_name, local_id, action, priority, timestamp, retry_count, last_error',
       meta: 'key'
     });
@@ -106,6 +106,51 @@ class HospitalDB extends Dexie {
     }
   }
 
+  // NEW: Lock patient for multi-device cooperation
+  async lockPatient(patientLocalId, staffId) {
+    const journey = await this.patientJourney
+      .where('patient_local_id')
+      .equals(patientLocalId)
+      .first();
+    
+    if (journey && !journey.locked_by) {
+      const newVersion = (journey.version || 0) + 1;
+      await this.patientJourney.update(journey.id, {
+        status: 'in-progress',
+        locked_by: staffId,
+        sync_status: 'pending',
+        version: newVersion,
+        updated_at: new Date().toISOString()
+      });
+      // Queue for immediate sync to notify other devices
+      await this.queueForSync('patientJourney', journey.patient_local_id, 1);
+      return true; // Successfully locked
+    }
+    return false; // Already locked by someone else
+  }
+
+  // NEW: Unlock patient (when nurse cancels or on error)
+  async unlockPatient(patientLocalId) {
+    const journey = await this.patientJourney
+      .where('patient_local_id')
+      .equals(patientLocalId)
+      .first();
+    
+    if (journey && journey.locked_by) {
+      const newVersion = (journey.version || 0) + 1;
+      await this.patientJourney.update(journey.id, {
+        status: 'waiting',
+        locked_by: null,
+        sync_status: 'pending',
+        version: newVersion,
+        updated_at: new Date().toISOString()
+      });
+      await this.queueForSync('patientJourney', journey.patient_local_id, 1);
+      return true;
+    }
+    return false;
+  }
+
   async getPatientsAtStage(stage) {
     const journeys = await this.patientJourney
       .where('current_stage')
@@ -141,7 +186,7 @@ class HospitalDB extends Dexie {
     const journeys = await this.patientJourney
       .where('next_stage')
       .equals(stage)
-      .and(j => j.status === 'waiting')
+      .and(j => j.status === 'waiting' || j.status === 'in-progress')  // ← CHANGED: include in-progress
       .toArray();
     
     const patients = [];
@@ -164,6 +209,7 @@ class HospitalDB extends Dexie {
   }
 
   // FIXED: completeStage now sets status='completed' when journey is finished
+  // NEW: Also clears locked_by when completing stage
   async completeStage(patientLocalId, nextStage) {
     const journey = await this.patientJourney
       .where('patient_local_id')
@@ -180,6 +226,7 @@ class HospitalDB extends Dexie {
         current_stage: journey.next_stage,      // e.g., pharmacy → becomes current
         next_stage: nextStage,                   // 'completed' → becomes next
         status: isFinalStage ? 'completed' : 'waiting',  // ← FIX: completed when done
+        locked_by: isFinalStage ? null : journey.locked_by,  // ← NEW: clear lock when done
         sync_status: 'pending',
         version: newVersion,
         updated_at: new Date().toISOString()
