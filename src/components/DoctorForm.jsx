@@ -145,23 +145,23 @@ export default function DoctorForm() {
     const journey = patient.journey;
     const isLockedByMe = journey.locked_by === currentDoctorId;
     
-    // Patient is locked by SOMEONE ELSE
-    if (journey.status === 'in-progress' && journey.locked_by && !isLockedByMe) {
-      return {
-        text: `Being seen by ${journey.locked_by}`,
-        class: 'bg-orange-100 text-orange-800',
-        disabled: true,
-        borderColor: 'border-gray-300'
-      };
-    }
-    
-    // Patient is locked by ME (I can continue working)
-    if (journey.status === 'in-progress' && journey.locked_by && isLockedByMe) {
+    // Patient is locked by ME
+    if (journey.locked_by && isLockedByMe) {
       return {
         text: 'Continue 🔒',
         class: 'bg-blue-100 text-blue-800',
         disabled: false,
         borderColor: 'border-blue-500'
+      };
+    }
+    
+    // Patient is locked by SOMEONE ELSE (any other user)
+    if (journey.locked_by && !isLockedByMe) {
+      return {
+        text: `Being seen by ${journey.locked_by}`,
+        class: 'bg-orange-100 text-orange-800',
+        disabled: true,
+        borderColor: 'border-gray-300'
       };
     }
     

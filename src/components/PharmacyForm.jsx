@@ -1,50 +1,100 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { db } from '../db/schema';
 
 export default function PharmacyForm() {
   const [patients, setPatients] = useState([]);
   const [selectedPatient, setSelectedPatient] = useState(null);
-  const [saved, setSaved] = useState(false);
   const [message, setMessage] = useState('');
   const [currentPharmacistId, setCurrentPharmacistId] = useState('');
+
+  const loadPatients = useCallback(async () => {
+    const pharmacyPatients = await db.getPatientsForStage('pharmacy');
+    setPatients(pharmacyPatients);
+  }, []);
 
   useEffect(() => {
     const pharmacistId = localStorage.getItem('user_staff_id') || 'UNKNOWN';
     setCurrentPharmacistId(pharmacistId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     loadPatients();
+    // Auto-refresh every 2 seconds for better responsiveness
     const interval = setInterval(() => {
       loadPatients();
-    }, 5000);
+    }, 2000);
     return () => clearInterval(interval);
-  }, []);
-
-  const loadPatients = async () => {
-    const pharmacyPatients = await db.getPatientsForStage('pharmacy');
-    setPatients(pharmacyPatients);
-  };
+  }, [loadPatients]);
 
   const handleSelectPatient = async (patient) => {
     const pharmacistId = currentPharmacistId || localStorage.getItem('user_staff_id') || 'UNKNOWN';
     
-    // If already locked by me, just open it (no need to re-lock)
-    if (patient.journey?.locked_by === pharmacistId) {
-      setSelectedPatient(patient);
-      return;
+    // Force a sync to get latest data before attempting to lock
+    if (window.syncHook?.performSync) {
+      console.log('PharmacyForm: Syncing before locking patient...');
+      await window.syncHook.performSync();
+      await loadPatients(); // Refresh with latest data
     }
     
-    const locked = await db.lockPatient(patient.local_id, pharmacistId);
-    
-    if (!locked) {
-      await loadPatients();
-      setMessage(`Patient ${patient.name} is already being dispensed by ${patient.journey.locked_by}`);
+    // Re-check the patient data after sync
+    const updatedPatient = patients.find(p => p.local_id === patient.local_id);
+    if (!updatedPatient) {
+      setMessage('Patient not found. Please refresh the page.');
       setTimeout(() => setMessage(''), 3000);
       return;
     }
     
-    setSelectedPatient(patient);
+    // If already locked by me, just open it
+    if (updatedPatient.journey?.locked_by === pharmacistId) {
+      setSelectedPatient(updatedPatient);
+      return;
+    }
+    
+    // If locked by someone else, show message
+    if (updatedPatient.journey?.locked_by && updatedPatient.journey.locked_by !== pharmacistId) {
+      setMessage(`Patient ${updatedPatient.name} is already being dispensed by ${updatedPatient.journey.locked_by}`);
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    
+    const locked = await db.lockPatient(updatedPatient.local_id, pharmacistId);
+    
+    if (!locked) {
+      // Double-check: fetch fresh data in case of race condition
+      await loadPatients();
+      const freshPatient = patients.find(p => p.local_id === patient.local_id);
+      setMessage(`Patient ${freshPatient?.name || patient.name} is already being dispensed`);
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    
+    // SUCCESSFULLY LOCKED - immediately update UI so other users see it
+    const updatedPatients = patients.map(p => {
+      if (p.local_id === patient.local_id) {
+        return {
+          ...p,
+          journey: {
+            ...p.journey,
+            locked_by: pharmacistId,
+            status: 'in-progress'
+          }
+        };
+      }
+      return p;
+    });
+    setPatients(updatedPatients);
+    
+    setSelectedPatient({
+      ...updatedPatient,
+      journey: {
+        ...updatedPatient.journey,
+        locked_by: pharmacistId,
+        status: 'in-progress'
+      }
+    });
+    
+    // Sync immediately to notify other devices
     if (window.syncHook?.performSync) {
       await window.syncHook.performSync();
     }
@@ -53,6 +103,23 @@ export default function PharmacyForm() {
   const handleBack = async () => {
     if (selectedPatient) {
       await db.unlockPatient(selectedPatient.local_id);
+      
+      // CRITICAL: Update UI immediately to show patient is unlocked
+      const updatedPatients = patients.map(p => {
+        if (p.local_id === selectedPatient.local_id) {
+          return {
+            ...p,
+            journey: {
+              ...p.journey,
+              locked_by: null,
+              status: 'waiting'
+            }
+          };
+        }
+        return p;
+      });
+      setPatients(updatedPatients);
+      
       if (window.syncHook?.performSync) {
         await window.syncHook.performSync();
       }
@@ -98,11 +165,9 @@ export default function PharmacyForm() {
         await window.syncHook.performSync();
       }
       
-      setSaved(true);
       setMessage(`✓ Medication dispensed to ${selectedPatient.name}! Patient journey complete.`);
       
       setTimeout(() => {
-        setSaved(false);
         setSelectedPatient(null);
         loadPatients();
       }, 2000);
@@ -115,18 +180,8 @@ export default function PharmacyForm() {
     const journey = patient.journey;
     const isLockedByMe = journey.locked_by === currentPharmacistId;
     
-    // Locked by SOMEONE ELSE
-    if (journey.status === 'in-progress' && journey.locked_by && !isLockedByMe) {
-      return {
-        text: `Dispensing by ${journey.locked_by}`,
-        class: 'bg-orange-100 text-orange-800',
-        disabled: true,
-        borderColor: 'border-gray-300'
-      };
-    }
-    
     // Locked by ME
-    if (journey.status === 'in-progress' && journey.locked_by && isLockedByMe) {
+    if (journey.locked_by && isLockedByMe) {
       return {
         text: 'Continue 🔒',
         class: 'bg-blue-100 text-blue-800',
@@ -135,6 +190,17 @@ export default function PharmacyForm() {
       };
     }
     
+    // Locked by SOMEONE ELSE (any other user, regardless of department)
+    if (journey.locked_by && !isLockedByMe) {
+      return {
+        text: `Dispensing by ${journey.locked_by}`,
+        class: 'bg-orange-100 text-orange-800',
+        disabled: true,
+        borderColor: 'border-gray-300'
+      };
+    }
+    
+    // Waiting for dispensing
     if (journey.status === 'waiting') {
       return {
         text: 'Dispense',

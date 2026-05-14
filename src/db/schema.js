@@ -208,8 +208,7 @@ class HospitalDB extends Dexie {
     return patients;
   }
 
-  // FIXED: completeStage now sets status='completed' when journey is finished
-  // NEW: Also clears locked_by when completing stage
+  // FIXED: completeStage now ALWAYS clears locked_by when moving stages
   async completeStage(patientLocalId, nextStage) {
     const journey = await this.patientJourney
       .where('patient_local_id')
@@ -225,8 +224,8 @@ class HospitalDB extends Dexie {
       await this.patientJourney.update(journey.id, {
         current_stage: journey.next_stage,      // e.g., pharmacy → becomes current
         next_stage: nextStage,                   // 'completed' → becomes next
-        status: isFinalStage ? 'completed' : 'waiting',  // ← FIX: completed when done
-        locked_by: isFinalStage ? null : journey.locked_by,  // ← NEW: clear lock when done
+        status: isFinalStage ? 'completed' : 'waiting',  // completed when done, waiting otherwise
+        locked_by: null,  // ← FIXED: ALWAYS clear lock when moving stages
         sync_status: 'pending',
         version: newVersion,
         updated_at: new Date().toISOString()

@@ -1,61 +1,159 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { db } from '../db/schema';
 
 export default function LabForm() {
   const [patients, setPatients] = useState([]);
   const [selectedPatient, setSelectedPatient] = useState(null);
-  const [saved, setSaved] = useState(false);
   const [message, setMessage] = useState('');
   const [currentTechId, setCurrentTechId] = useState('');
+  const [isReady, setIsReady] = useState(false); // ← NEW: track readiness
 
+  const loadPatients = useCallback(async () => {
+    const labPatients = await db.getPatientsForStage('lab');
+    
+    // CRITICAL: Skip auto-unlock if we don't know who we are yet
+    if (!currentTechId || currentTechId === 'UNKNOWN') {
+      console.log('LabForm: Not ready yet, skipping auto-unlock');
+      setPatients(labPatients);
+      return;
+    }
+
+    // Auto-unlock stale locks from PREVIOUS stages only
+    let unlockedAny = false;
+    for (const patient of labPatients) {
+      const lock = patient.journey?.locked_by;
+      
+      // A lock is "stale" if:
+      // 1. It exists
+      // 2. It's NOT me
+      // 3. It's NOT another lab tech (same department)
+      // 4. It's from a previous stage (triage, doctor, etc.)
+      const isMyLock = lock === currentTechId;
+      const isAnotherLabTech = lock && (lock.startsWith('LAB') || lock.startsWith('TECH'));
+      const isStaleLock = lock && !isMyLock && !isAnotherLabTech && lock !== 'UNKNOWN';
+      
+      if (isStaleLock) {
+        console.log(`LabForm: Auto-unlocking ${patient.name} from ${lock} (stale lock)`);
+        await db.unlockPatient(patient.local_id);
+        unlockedAny = true;
+      }
+    }
+    
+    if (unlockedAny) {
+      // Sync to push unlocks to server
+      if (window.syncHook?.performSync) {
+        await window.syncHook.performSync();
+      }
+      // Reload fresh data
+      const freshPatients = await db.getPatientsForStage('lab');
+      setPatients(freshPatients);
+    } else {
+      setPatients(labPatients);
+    }
+  }, [currentTechId]);
+
+  // CRITICAL: Step 1 - Get techId FIRST
   useEffect(() => {
     const techId = localStorage.getItem('user_staff_id') || 'UNKNOWN';
+    console.log('LabForm: My staff_id is:', techId);
     setCurrentTechId(techId);
+    setIsReady(true); // ← Mark as ready
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // CRITICAL: Step 2 - Only load patients AFTER we have techId
   useEffect(() => {
-    loadPatients();
-    
-    const syncOnMount = async () => {
+    if (!isReady) return; // ← Don't run until techId is set
+
+    const init = async () => {
+      await loadPatients();
+      
+      // Sync on mount
       if (window.syncHook && window.syncHook.performSync) {
         console.log('LabForm: Syncing on mount...');
         await window.syncHook.performSync();
-        loadPatients();
+        await loadPatients(); // Reload after sync
       }
     };
-    syncOnMount();
     
+    init();
+
+    // Auto-refresh every 2 seconds for better responsiveness
     const refreshInterval = setInterval(() => {
       loadPatients();
-    }, 5000);
-    
-    return () => clearInterval(refreshInterval);
-  }, []);
+    }, 2000);
 
-  const loadPatients = async () => {
-    const labPatients = await db.getPatientsForStage('lab');
-    setPatients(labPatients);
-  };
+    return () => clearInterval(refreshInterval);
+  }, [isReady, loadPatients]); // ← Include loadPatients in dependencies
 
   const handleSelectPatient = async (patient) => {
     const techId = currentTechId || localStorage.getItem('user_staff_id') || 'UNKNOWN';
     
-    // If already locked by me, just open it (no need to re-lock)
-    if (patient.journey?.locked_by === techId) {
-      setSelectedPatient(patient);
-      return;
+    // Force a sync to get latest data before attempting to lock
+    if (window.syncHook?.performSync) {
+      console.log('LabForm: Syncing before locking patient...');
+      await window.syncHook.performSync();
+      await loadPatients(); // Refresh with latest data
     }
     
-    const locked = await db.lockPatient(patient.local_id, techId);
-    
-    if (!locked) {
-      await loadPatients();
-      setMessage(`Patient ${patient.name} is already being processed by ${patient.journey.locked_by}`);
+    // Re-check the patient data after sync
+    const updatedPatient = patients.find(p => p.local_id === patient.local_id);
+    if (!updatedPatient) {
+      setMessage('Patient not found. Please refresh the page.');
       setTimeout(() => setMessage(''), 3000);
       return;
     }
     
-    setSelectedPatient(patient);
+    // If already locked by me, just open it
+    if (updatedPatient.journey?.locked_by === techId) {
+      setSelectedPatient(updatedPatient);
+      return;
+    }
+    
+    // If locked by someone else, show message
+    if (updatedPatient.journey?.locked_by && updatedPatient.journey.locked_by !== techId) {
+      setMessage(`Patient ${updatedPatient.name} is already being processed by ${updatedPatient.journey.locked_by}`);
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    
+    const locked = await db.lockPatient(updatedPatient.local_id, techId);
+    
+    if (!locked) {
+      // Double-check: fetch fresh data in case of race condition
+      await loadPatients();
+      const freshPatient = patients.find(p => p.local_id === patient.local_id);
+      setMessage(`Patient ${freshPatient?.name || patient.name} is already being processed`);
+      setTimeout(() => setMessage(''), 3000);
+      return;
+    }
+    
+    // SUCCESSFULLY LOCKED - immediately update UI so other users see it
+    const updatedPatients = patients.map(p => {
+      if (p.local_id === patient.local_id) {
+        return {
+          ...p,
+          journey: {
+            ...p.journey,
+            locked_by: techId,
+            status: 'in-progress'
+          }
+        };
+      }
+      return p;
+    });
+    setPatients(updatedPatients);
+    
+    setSelectedPatient({
+      ...updatedPatient,
+      journey: {
+        ...updatedPatient.journey,
+        locked_by: techId,
+        status: 'in-progress'
+      }
+    });
+    
+    // Sync immediately to notify other devices
     if (window.syncHook?.performSync) {
       await window.syncHook.performSync();
     }
@@ -64,6 +162,23 @@ export default function LabForm() {
   const handleBack = async () => {
     if (selectedPatient) {
       await db.unlockPatient(selectedPatient.local_id);
+      
+      // Update UI immediately
+      const updatedPatients = patients.map(p => {
+        if (p.local_id === selectedPatient.local_id) {
+          return {
+            ...p,
+            journey: {
+              ...p.journey,
+              locked_by: null,
+              status: 'waiting'
+            }
+          };
+        }
+        return p;
+      });
+      setPatients(updatedPatients);
+      
       if (window.syncHook?.performSync) {
         await window.syncHook.performSync();
       }
@@ -115,11 +230,9 @@ export default function LabForm() {
         await window.syncHook.performSync();
       }
       
-      setSaved(true);
       setMessage(`✓ Lab results saved for ${selectedPatient.name}! Sent to doctor.`);
       
       setTimeout(() => {
-        setSaved(false);
         setSelectedPatient(null);
         loadPatients();
       }, 2000);
@@ -132,18 +245,8 @@ export default function LabForm() {
     const journey = patient.journey;
     const isLockedByMe = journey.locked_by === currentTechId;
     
-    // Locked by SOMEONE ELSE
-    if (journey.status === 'in-progress' && journey.locked_by && !isLockedByMe) {
-      return {
-        text: `Processing by ${journey.locked_by}`,
-        class: 'bg-orange-100 text-orange-800',
-        disabled: true,
-        borderColor: 'border-gray-300'
-      };
-    }
-    
     // Locked by ME
-    if (journey.status === 'in-progress' && journey.locked_by && isLockedByMe) {
+    if (journey.locked_by && isLockedByMe) {
       return {
         text: 'Continue 🔒',
         class: 'bg-blue-100 text-blue-800',
@@ -152,20 +255,22 @@ export default function LabForm() {
       };
     }
     
-    if (journey.status === 'waiting') {
+    // Locked by SOMEONE ELSE (any other user, regardless of department)
+    if (journey.locked_by && !isLockedByMe) {
       return {
-        text: 'Run Tests',
-        class: 'bg-indigo-100 text-indigo-800',
-        disabled: false,
-        borderColor: 'border-indigo-500'
+        text: `Processing by ${journey.locked_by}`,
+        class: 'bg-orange-100 text-orange-800',
+        disabled: true,
+        borderColor: 'border-gray-300'
       };
     }
     
+    // Waiting
     return {
-      text: journey.status,
-      class: 'bg-gray-100 text-gray-800',
-      disabled: true,
-      borderColor: 'border-gray-300'
+      text: 'Run Tests',
+      class: 'bg-indigo-100 text-indigo-800',
+      disabled: false,
+      borderColor: 'border-indigo-500'
     };
   };
 
